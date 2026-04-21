@@ -16,10 +16,6 @@ OWNER_ID = 8480939483
 API_ID = 35800959
 API_HASH = "708e7d0bc3572355bcaf68562cc068f1"
 
-# Для Bothost
-PORT = int(os.environ.get("PORT", 8080))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://your-app.bothost.com")
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -169,7 +165,6 @@ async def participate_one_account(session_string, account_name, channels, ref_li
             if event.message.buttons:
                 rows = event.message.buttons
                 if rows:
-                    # Нажимаем среднюю кнопку
                     row = rows[len(rows)//2]
                     btn = row[len(row)//2]
                     try:
@@ -179,7 +174,6 @@ async def participate_one_account(session_string, account_name, channels, ref_li
                     except:
                         pass
         
-        # Ждём до 3 минут
         for _ in range(36):
             if success:
                 break
@@ -199,7 +193,7 @@ async def participate_one_account(session_string, account_name, channels, ref_li
             pass
         return False
 
-# ========== ОБРАБОТЧИКИ КОМАНД ==========
+# ========== ОБРАБОТЧИКИ ==========
 
 async def start_cmd(update: Update, context):
     if update.effective_user.id != OWNER_ID:
@@ -354,14 +348,14 @@ async def start_participation(update: Update, context):
     channels = settings.get('channels', '')
     ref_link = settings.get('ref_link', '')
     
-    await query.edit_message_text(f"🚀 Запуск {len(accounts)} аккаунтов...\nЭто может занять несколько минут.")
+    await query.edit_message_text(f"🚀 Запуск {len(accounts)} аккаунтов...")
     
     success_count = 0
     for acc in accounts:
         acc_id, phone, username, first_name, session = acc
         name = f"@{username or first_name or 'user'} ({phone})"
         
-        await context.bot.send_message(OWNER_ID, f"🔄 Обрабатываю {name}...")
+        await context.bot.send_message(OWNER_ID, f"🔄 {name}...")
         
         result = await participate_one_account(session, name, channels, ref_link, context.bot)
         if result:
@@ -371,7 +365,7 @@ async def start_participation(update: Update, context):
     
     await context.bot.send_message(OWNER_ID, f"✅ *Завершено!*\nУспешно: {success_count}/{len(accounts)}", parse_mode="Markdown")
 
-# ========== ЗАПУСК ДЛЯ BOTHOST ==========
+# ========== ЗАПУСК ==========
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -380,15 +374,8 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     
-    print(f"✅ Бот запущен на порту {PORT}")
-    
-    # Вебхук для Bothost
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=BOT_TOKEN,
-        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
-    )
+    print("✅ Бот запущен (polling)")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
