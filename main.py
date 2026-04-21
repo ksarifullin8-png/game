@@ -1,532 +1,394 @@
-import random
-import logging
 import asyncio
-from datetime import datetime
+import os
+import re
+import sqlite3
+import logging
+from threading import Lock
+from telethon import TelegramClient, functions, types, events
+from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-from telegram.constants import ParseMode
-from telegram.error import TimedOut, NetworkError
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
-TOKEN = "8651605499:AAH-5_guYbiuIeVIlY7bGqL_j_B-OjtXg9A"
+# ========== НАСТРОЙКИ ==========
+BOT_TOKEN = "8729005607:AAGFxfC7TmM0XfexLV_BVce6SMpwau7VNT0"
+OWNER_ID = 8480939483
+API_ID = 35800959
+API_HASH = "708e7d0bc3572355bcaf68562cc068f1"
 
-# ================= БОЛЬШОЙ СПИСОК ИЗВЕСТНЫХ ПЕРСОНАЖЕЙ =================
-CATEGORIES = {
-    "default": [
-        "Дарт Вейдер", "Йода", "Гарри Поттер", "Гермиона Грейнджер", "Волан-де-Морт", "Джон Сноу",
-        "Дейенерис Таргариен", "Тирион Ланнистер", "Шерлок Холмс", "Джек Воробей", "Индиана Джонс",
-        "Терминатор", "Нео", "Форрест Гамп", "Мистер Бин", "Доктор Хаус", "Шелдон Купер",
-        "Губка Боб", "Патрик Стар", "Шрек", "Осёл", "Эльза", "Симба", "Скар", "Винни-Пух",
-        "Пикачу", "Марио", "Луиджи", "Чебурашка", "Крокодил Гена", "Маша", "Медведь",
-        "Наполеон", "Клеопатра", "Альберт Эйнштейн", "Леонардо да Винчи", "Никола Тесла",
-        "Лев", "Тигр", "Панда", "Смартфон", "Пицца", "Лампочка", "Автомобиль"
-    ],
-    "кино": [
-        "Дарт Вейдер", "Йода", "Джек Воробей", "Индиана Джонс", "Терминатор", "Нео", "Форрест Гамп",
-        "Железный человек", "Капитан Америка", "Бэтмен", "Супермен", "Чудо-женщина", "Джокер",
-        "Харли Квинн", "Росомаха", "Дэдпул", "Локи", "Тор"
-    ],
-    "мультики": [
-        "Губка Боб", "Патрик Стар", "Шрек", "Осёл", "Эльза", "Анна", "Моана", "Симба", "Винни-Пух",
-        "Пикачу", "Марио", "Чебурашка", "Маша", "Медведь", "Карлсон", "Матроскин", "Снежная Королева"
-    ],
-    "знаменитости": [
-        "Тейлор Свифт", "Бейонсе", "Ариана Гранде", "Билли Айлиш", "Илон Маск", "Леонардо ДиКаприо",
-        "Скарлетт Йоханссон", "Марго Робби", "Том Круз", "Дженнифер Лоуренс", "Майкл Джексон",
-        "Фредди Меркьюри", "Элвис Пресли", "Мэрилин Монро", "Брэд Питт"
-    ],
-    "вещи": [
-        "Смартфон", "Пицца", "Гамбургер", "Лампочка", "Телевизор", "Автомобиль", "Самолёт",
-        "Гитара", "Микрофон", "Корона", "Меч", "Зеркало", "Кофе", "Шоколадка", "Мороженое",
-        "Наушники", "Книга", "Футбольный мяч"
-    ],
-    "русские": [
-        "Чебурашка", "Крокодил Гена", "Маша", "Медведь", "Карлсон", "Матроскин", "Шарик",
-        "Дядя Фёдор", "Волк (Ну погоди)", "Заяц (Ну погоди)", "Ёжик в тумане"
-    ]
-}
+# Для Bothost
+PORT = int(os.environ.get("PORT", 8080))
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "https://your-app.bothost.com")
 
-games = {}        # игры на стадии сбора
-active_games = {} # активные игры
-waiting_for_name = {}  # словарь для отслеживания ожидающих ввода имени
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Декоратор для повторных попыток
-async def retry_on_error(func, *args, **kwargs):
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            return await func(*args, **kwargs)
-        except (TimedOut, NetworkError) as e:
-            if attempt == max_retries - 1:
-                logging.error(f"Ошибка после {max_retries} попыток: {e}")
-                return None
-            logging.warning(f"Ошибка {e}, попытка {attempt + 1}/{max_retries}")
-            await asyncio.sleep(2 ** attempt)
-    return None
+# Состояния и блокировка БД
+user_state = {}
+temp_data = {}
+db_lock = Lock()
 
-# ================= /help =================
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """🎮 <b>Игра «Кто я?»</b>
+# ========== БАЗА ДАННЫХ ==========
+def get_db():
+    return sqlite3.connect('contest_bot.db', timeout=30, check_same_thread=False)
 
-<b>Правила игры:</b>
-1️⃣ Создатель запускает игру командой /whyme
-2️⃣ Участники нажимают кнопку "Присоединиться" и вводят имя
-3️⃣ После сбора всех игроков, каждому в ЛС приходит список персонажей ДРУГИХ участников
-4️⃣ Твой персонаж НЕИЗВЕСТЕН тебе
-5️⃣ Задавай вопросы в группе, чтобы угадать своего персонажа
-6️⃣ Когда угадаешь - бот напишет в чате поздравление!
+def init_db():
+    with db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS accounts
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      phone TEXT UNIQUE,
+                      username TEXT,
+                      first_name TEXT,
+                      session_string TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS settings
+                     (key TEXT PRIMARY KEY,
+                      value TEXT)''')
+        conn.commit()
+        conn.close()
 
-<b>Команды:</b>
-/whyme (число) [категория] — запустить игру
-/help — показать эту справку
+init_db()
 
-<b>Примеры:</b>
-/whyme 6
-/whyme 5 кино
-/whyme 8 мультики
+def save_channels(channels):
+    with db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('channels', ?)", (channels,))
+        conn.commit()
+        conn.close()
 
-<b>Доступные категории:</b> кино, мультики, знаменитости, вещи, русские
+def save_ref_link(link):
+    with db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('ref_link', ?)", (link,))
+        conn.commit()
+        conn.close()
 
-Приятной игры! 🔥"""
+def get_settings():
+    with db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT key, value FROM settings")
+        data = dict(c.fetchall())
+        conn.close()
+    return data
 
-    await retry_on_error(
-        update.message.reply_text,
-        help_text,
-        parse_mode=ParseMode.HTML
-    )
+def get_all_accounts():
+    with db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT id, phone, username, first_name, session_string FROM accounts")
+        accounts = c.fetchall()
+        conn.close()
+    return accounts
 
+def save_account(phone, username, first_name, session_string):
+    with db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("INSERT INTO accounts (phone, username, first_name, session_string) VALUES (?, ?, ?, ?) "
+                  "ON CONFLICT(phone) DO UPDATE SET session_string=?, username=?, first_name=?",
+                  (phone, username, first_name, session_string, session_string, username, first_name))
+        conn.commit()
+        conn.close()
 
-async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Проверяем, что команда вызвана в группе
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("❌ Игру можно запустить только в группе!")
-        return
+# ========== УЧАСТИЕ В КОНКУРСЕ ==========
+
+async def participate_one_account(session_string, account_name, channels, ref_link, owner_bot):
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            logger.error(f"[{account_name}] ❌ Сессия недействительна")
+            return False
         
-    args = context.args
-    if not args:
-        await retry_on_error(
-            update.message.reply_text,
-            "Использование: /whyme (число от 3 до 10) [категория]\nНапример: /whyme 6 кино\nНапиши /help"
-        )
-        return
-
-    try:
-        max_p = int(args[0])
-        if not 3 <= max_p <= 10:
-            raise ValueError
-    except:
-        await retry_on_error(
-            update.message.reply_text,
-            "Число участников должно быть от 3 до 10"
-        )
-        return
-
-    category = args[1].lower() if len(args) > 1 else "default"
-    if category not in CATEGORIES:
-        category = "default"
-
-    chat_id = update.effective_chat.id
-    creator_id = update.effective_user.id
-
-    # Проверяем, есть ли уже игра в этом чате
-    if chat_id in games or chat_id in active_games:
-        await retry_on_error(
-            update.message.reply_text,
-            "⚠️ В этом чате уже есть активная игра!"
-        )
-        return
-
-    # Получаем username бота для ссылки
-    try:
-        bot_info = await retry_on_error(context.bot.get_me)
-        bot_username = bot_info.username if bot_info else "whyme_bot"
-    except:
-        bot_username = "whyme_bot"
-
-    keyboard = [
-        [InlineKeyboardButton("👥 Присоединиться к игре", url=f"https://t.me/{bot_username}?start=join_{chat_id}")],
-        [InlineKeyboardButton("❌ Отменить игру", callback_data=f"cancel_{chat_id}")]
-    ]
-
-    try:
-        msg = await retry_on_error(
-            update.message.reply_text,
-            f"🎮 <b>Игра «Кто я?»</b> запущена!\n\n"
-            f"Максимум: <b>{max_p}</b>\n"
-            f"Категория: <b>{category}</b>\n"
-            f"Участников: <b>0/{max_p}</b>\n\n"
-            f"⏳ Время на сбор: 10 минут",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.HTML
-        )
+        # 1. Подписка на каналы
+        for ch in channels.split(','):
+            ch = ch.strip().replace('@', '').replace('https://t.me/', '')
+            if ch:
+                try:
+                    await client(functions.channels.JoinChannelRequest(ch))
+                    logger.info(f"[{account_name}] ✅ Подписался на {ch}")
+                    await asyncio.sleep(3)
+                except Exception as e:
+                    logger.error(f"[{account_name}] ❌ {ch}: {e}")
+        
+        # 2. Переход по ссылке
+        match = re.search(r'(?:t\.me|telegram\.me)/([^/?]+)(?:\?start=(\w+))?', ref_link)
+        if match:
+            bot_username = match.group(1)
+            start_param = match.group(2)
+            
+            if start_param:
+                await client.send_message(bot_username, f"/start {start_param}")
+            else:
+                await client.send_message(bot_username, "/start")
+            
+            logger.info(f"[{account_name}] ✅ Перешёл в @{bot_username}")
+        else:
+            logger.error(f"[{account_name}] ❌ Неверная ссылка")
+            return False
+        
+        await asyncio.sleep(3)
+        
+        # 3. Обработка ответов бота
+        success = False
+        
+        @client.on(events.NewMessage(from_user=bot_username))
+        async def handle(event):
+            nonlocal success
+            text = event.message.text.lower() if event.message.text else ""
+            
+            if any(w in text for w in ['участник', 'participant', 'поздравля', 'успешно', 'вы участник', 'теперь вы']):
+                success = True
+                logger.info(f"[{account_name}] 🎉 УЧАСТВУЕТ!")
+                await owner_bot.send_message(OWNER_ID, f"✅ *{account_name}* участвует в конкурсе!", parse_mode="Markdown")
+                await client.disconnect()
+                return
+            
+            if 'реакци' in text or 'reaction' in text or 'поставь' in text:
+                try:
+                    await client(functions.messages.SendReactionRequest(
+                        peer=event.chat_id, msg_id=event.message.id,
+                        reaction=[types.ReactionEmoji(emoticon="👍")]
+                    ))
+                    logger.info(f"[{account_name}] 👍 Реакция")
+                    await asyncio.sleep(1)
+                except:
+                    pass
+            
+            nums = re.findall(r'\b\d{3,6}\b', text)
+            if nums and ('числ' in text or 'цифр' in text or 'код' in text or 'видите' in text):
+                await event.message.respond(nums[0])
+                logger.info(f"[{account_name}] 📤 Код: {nums[0]}")
+                await asyncio.sleep(1)
+            
+            if event.message.buttons:
+                rows = event.message.buttons
+                if rows:
+                    # Нажимаем среднюю кнопку
+                    row = rows[len(rows)//2]
+                    btn = row[len(row)//2]
+                    try:
+                        await btn.click()
+                        logger.info(f"[{account_name}] 🖱️ {btn.text}")
+                        await asyncio.sleep(1)
+                    except:
+                        pass
+        
+        # Ждём до 3 минут
+        for _ in range(36):
+            if success:
+                break
+            await asyncio.sleep(5)
+        
+        if not success:
+            logger.warning(f"[{account_name}] ⏱️ Таймаут")
+        
+        await client.disconnect()
+        return success
+        
     except Exception as e:
-        await retry_on_error(
-            update.message.reply_text,
-            "❌ Ошибка при запуске игры. Попробуйте позже."
-        )
-        logging.error(f"Ошибка при запуске игры: {e}")
-        return
-
-    if msg:
-        games[chat_id] = {
-            "max_players": max_p,
-            "players": [],
-            "names": {},
-            "message_id": msg.message_id,
-            "category": category,
-            "creator": creator_id,
-            "start_time": datetime.now()
-        }
-        
-        # Запускаем таймер на 10 минут
-        asyncio.create_task(auto_cancel_game(chat_id, context))
-
-
-async def auto_cancel_game(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    await asyncio.sleep(600)  # 10 минут
-    if chat_id in games:
+        logger.error(f"[{account_name}] ❌ {e}")
         try:
-            await context.bot.send_message(chat_id, "⏰ Время вышло. Не набралось участников — игра отменена.")
+            await client.disconnect()
         except:
             pass
-        if chat_id in games:
-            del games[chat_id]
+        return False
 
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
 
-async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or not str(context.args[0]).startswith("join_"):
+async def start_cmd(update: Update, context):
+    if update.effective_user.id != OWNER_ID:
         return
     
-    # Проверяем, что это личное сообщение
-    if update.effective_chat.type != "private":
-        return
-        
-    try:
-        chat_id = int(str(context.args[0]).split("_")[1])
-    except:
-        await update.message.reply_text("❌ Неверная ссылка для присоединения.")
-        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Добавить аккаунт", callback_data="add_acc")],
+        [InlineKeyboardButton("📋 Аккаунты", callback_data="list_acc")],
+        [InlineKeyboardButton("🚀 НАЧАТЬ УЧАСТВОВАТЬ", callback_data="start_go")],
+    ])
+    await update.message.reply_text("🎯 *Главное меню*", reply_markup=keyboard, parse_mode="Markdown")
 
-    if chat_id not in games:
-        await retry_on_error(
-            update.message.reply_text,
-            "❌ Игра уже закончилась или ещё не началась."
-        )
-        return
-
-    game = games[chat_id]
-    user_id = update.effective_user.id
-
-    if user_id in game["players"]:
-        await retry_on_error(
-            update.message.reply_text,
-            "✅ Ты уже участвуешь в игре!"
-        )
-        return
-    if len(game["players"]) >= game["max_players"]:
-        await retry_on_error(
-            update.message.reply_text,
-            "❌ Игра уже заполнена."
-        )
-        return
-
-    # Сохраняем, что пользователь ожидает ввода имени
-    waiting_for_name[user_id] = chat_id
-    await retry_on_error(
-        update.message.reply_text,
-        "📝 Отправь своё имя, которое будет отображаться в игре (от 2 до 20 символов):"
-    )
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик всех текстовых сообщений"""
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    text = update.message.text.strip()
-    
-    # Проверяем, ожидает ли пользователь ввода имени
-    if user_id in waiting_for_name:
-        game_chat_id = waiting_for_name[user_id]
-        
-        # Проверяем, существует ли игра
-        if game_chat_id not in games:
-            await update.message.reply_text("❌ Игра уже закончилась.")
-            del waiting_for_name[user_id]
-            return
-            
-        game = games[game_chat_id]
-        
-        # Проверяем имя
-        if len(text) < 2 or len(text) > 20:
-            await update.message.reply_text("❌ Имя должно быть от 2 до 20 символов. Попробуй ещё раз:")
-            return
-            
-        # Проверяем, не заполнена ли игра
-        if len(game["players"]) >= game["max_players"]:
-            await update.message.reply_text("❌ Игра уже заполнена.")
-            del waiting_for_name[user_id]
-            return
-            
-        # Добавляем игрока
-        game["players"].append(user_id)
-        game["names"][user_id] = text
-        
-        await update.message.reply_text(
-            f"✅ Ты зарегистрирован как <b>{text}</b>! Ожидай начала игры.",
-            parse_mode=ParseMode.HTML
-        )
-        
-        # Удаляем из ожидания
-        del waiting_for_name[user_id]
-        
-        # Обновляем сообщение в группе
-        await update_group_message(game_chat_id, context)
-        
-        # Проверяем, набралось ли нужное количество игроков
-        if len(game["players"]) == game["max_players"]:
-            await start_the_game(game_chat_id, context)
-        return
-    
-    # Если это сообщение в группе и игра активна, проверяем угадывание
-    if chat_id in active_games:
-        await check_guess(update, context)
-
-
-async def update_group_message(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    if chat_id not in games:
-        return
-    game = games[chat_id]
-    current = len(game["players"])
-
-    try:
-        bot_info = await retry_on_error(context.bot.get_me)
-        bot_username = bot_info.username if bot_info else "whyme_bot"
-    except:
-        bot_username = "whyme_bot"
-    
-    keyboard = [
-        [InlineKeyboardButton("👥 Присоединиться к игре", url=f"https://t.me/{bot_username}?start=join_{chat_id}")],
-        [InlineKeyboardButton("❌ Отменить игру", callback_data=f"cancel_{chat_id}")]
-    ]
-
-    try:
-        await retry_on_error(
-            context.bot.edit_message_text,
-            chat_id=chat_id,
-            message_id=game["message_id"],
-            text=f"🎮 <b>Игра «Кто я?»</b>\n\n"
-                 f"Максимум: <b>{game['max_players']}</b>\n"
-                 f"Категория: <b>{game['category']}</b>\n"
-                 f"Участников: <b>{current}/{game['max_players']}</b>\n\n"
-                 f"⏳ Время на сбор: 10 минут",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.HTML
-        )
-    except Exception as e:
-        logging.error(f"Ошибка обновления сообщения: {e}")
-
-
-async def start_the_game(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    game = games.pop(chat_id)
-    players = game["players"]
-    char_list = CATEGORIES[game["category"]]
-
-    # Выбираем персонажей
-    if len(players) <= len(char_list):
-        selected = random.sample(char_list, len(players))
-    else:
-        selected = random.choices(char_list, k=len(players))
-
-    # Создаем словарь: user_id -> его персонаж
-    user_characters = dict(zip(players, selected))
-    
-    # Сохраняем игру
-    active_games[chat_id] = {
-        "characters": user_characters,
-        "names": game["names"],
-        "guessed": set()  # для отслеживания угадавших
-    }
-
-    # Отправляем сообщение в группу о начале игры
-    players_list = ", ".join([game["names"][p] for p in players])
-    await retry_on_error(
-        context.bot.send_message,
-        chat_id,
-        f"🎉 <b>Игра «Кто я?» началась!</b>\n\n"
-        f"👥 Участники: {players_list}\n"
-        f"📚 Категория: {game['category']}\n\n"
-        f"💡 <b>Правила:</b>\n"
-        f"• Ты НЕ ЗНАЕШЬ своего персонажа\n"
-        f"• Задавай вопросы в чате (например: \"Я животное?\", \"Я из мультфильма?\")\n"
-        f"• Другие игроки отвечают ДА или НЕТ\n"
-        f"• Когда угадаешь - напиши в чате название персонажа!\n\n"
-        f"🎯 Удачи всем! 🔥",
-        parse_mode=ParseMode.HTML
-    )
-
-    # Отправляем каждому игроку список персонажей ДРУГИХ игроков (не его собственного!)
-    for user_id in players:
-        # Получаем персонажа этого игрока
-        my_character = user_characters[user_id]
-        
-        # Создаем список персонажей других игроков
-        other_characters = []
-        for other_id, char in user_characters.items():
-            if other_id != user_id:
-                other_characters.append(f"• {game['names'][other_id]} → {char}")
-        
-        other_characters_text = "\n".join(other_characters) if other_characters else "Нет других игроков"
-        
-        name = game["names"][user_id]
-        
-        try:
-            await retry_on_error(
-                context.bot.send_message,
-                user_id,
-                f"🎮 <b>Игра «Кто я?» началась!</b>\n\n"
-                f"👤 Твоё имя: <b>{name}</b>\n"
-                f"❓ <b>Твой персонаж НЕИЗВЕСТЕН!</b>\n\n"
-                f"<b>Персонажи других игроков:</b>\n{other_characters_text}\n\n"
-                f"💡 <b>Как играть:</b>\n"
-                f"1. Задавай вопросы в группе, чтобы угадать своего персонажа\n"
-                f"2. Другие игроки будут отвечать на твои вопросы\n"
-                f"3. Когда угадаешь - напиши в чате название персонажа!\n\n"
-                f"🎯 Удачи! 🔥",
-                parse_mode=ParseMode.HTML
-            )
-        except Exception as e:
-            logging.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
-
-
-async def cancel_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback_handler(update: Update, context):
     query = update.callback_query
     await query.answer()
-    try:
-        chat_id = int(query.data.split("_")[1])
-    except:
-        return
-
-    if chat_id in games:
-        if query.from_user.id == games[chat_id]["creator"]:
-            await retry_on_error(
-                context.bot.send_message,
-                chat_id,
-                "❌ Игра отменена создателем."
-            )
-            games.pop(chat_id, None)
-            try:
-                await query.message.delete()
-            except:
-                pass
-        else:
-            await query.answer("❌ Только создатель игры может её отменить!", show_alert=True)
-    else:
-        await query.answer("Игра уже завершена!", show_alert=True)
-
-
-async def check_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет, угадал ли игрок своего персонажа"""
-    chat_id = update.effective_chat.id
-    if chat_id not in active_games:
-        return
-
-    user_id = update.effective_user.id
-    text = update.message.text.lower()
-    message = update.message
-
-    game_data = active_games[chat_id]
+    user_id = query.from_user.id
     
-    # Проверяем, есть ли такой игрок в игре и не угадал ли он уже
-    if user_id in game_data["characters"] and user_id not in game_data["guessed"]:
-        my_character = game_data["characters"][user_id].lower()
-        
-        # Проверяем угадывание (игрок должен написать название персонажа)
-        if my_character in text or any(word in text for word in my_character.split()):
-            # Помечаем игрока как угадавшего
-            game_data["guessed"].add(user_id)
-            
-            name = game_data["names"][user_id]
-            character = game_data["characters"][user_id]
-            
-            # Отправляем поздравление в чат
-            await retry_on_error(
-                context.bot.send_message,
-                chat_id,
-                f"🎉 <b>{name}</b> угадал своего персонажа!\n\n"
-                f"✨ Его персонаж: <b>{character}</b>\n\n"
-                f"🔥 Поздравляем! 🎊",
-                parse_mode=ParseMode.HTML
+    if user_id != OWNER_ID:
+        return
+    
+    data = query.data
+    
+    if data == "add_acc":
+        user_state[user_id] = "waiting_phone"
+        await query.edit_message_text(
+            "📱 Введите номер телефона:\nПример: +79123456789",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
+        )
+    
+    elif data == "list_acc":
+        accounts = get_all_accounts()
+        if not accounts:
+            text = "📭 Нет аккаунтов"
+        else:
+            text = f"📋 *Аккаунтов: {len(accounts)}*\n\n"
+            for acc in accounts:
+                text += f"• {acc[3] or acc[2] or 'Без имени'} — {acc[1]}\n"
+        await query.edit_message_text(text, parse_mode="Markdown")
+    
+    elif data == "start_go":
+        settings = get_settings()
+        if 'channels' not in settings or 'ref_link' not in settings:
+            user_state[user_id] = "waiting_channels"
+            await query.edit_message_text(
+                "📢 *Этап 1/2*\nВведите каналы через запятую:\nПример: @chan1, @chan2, @chan3",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
             )
-            
-            # Отправляем личное сообщение игроку
-            try:
-                await retry_on_error(
-                    context.bot.send_message,
-                    user_id,
-                    f"🎉 <b>Поздравляю! Ты угадал!</b>\n\n"
-                    f"Твой персонаж: <b>{character}</b>\n\n"
-                    f"Отличная игра! 🔥",
-                    parse_mode=ParseMode.HTML
-                )
-            except Exception as e:
-                logging.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
-            
-            # Проверяем, все ли угадали
-            if len(game_data["guessed"]) == len(game_data["characters"]):
-                await retry_on_error(
-                    context.bot.send_message,
-                    chat_id,
-                    f"🏆 <b>ИГРА ОКОНЧЕНА!</b> 🏆\n\n"
-                    f"Все участники угадали своих персонажей!\n\n"
-                    f"Спасибо за игру! 🎉",
-                    parse_mode=ParseMode.HTML
-                )
-                # Удаляем игру
-                del active_games[chat_id]
-            
-            # Удаляем сообщение с угадыванием, чтобы не засорять чат
-            try:
-                await message.delete()
-            except:
-                pass
+        else:
+            await start_participation(update, context)
+    
+    elif data == "cancel":
+        user_state.pop(user_id, None)
+        temp_data.pop(user_id, None)
+        await query.edit_message_text("❌ Отменено")
 
+async def message_handler(update: Update, context):
+    user_id = update.effective_user.id
+    if user_id != OWNER_ID:
+        return
+    
+    state = user_state.get(user_id)
+    text = update.message.text.strip()
+    
+    if state == "waiting_phone":
+        user_state[user_id] = "waiting_code"
+        temp_data[user_id] = {"phone": text}
+        
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await client.connect()
+        
+        try:
+            sent = await client.send_code_request(text)
+            temp_data[user_id]["client"] = client
+            temp_data[user_id]["hash"] = sent.phone_code_hash
+            await update.message.reply_text("📨 Введите код из Telegram:")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+            user_state.pop(user_id, None)
+            await client.disconnect()
+    
+    elif state == "waiting_code":
+        data = temp_data.get(user_id, {})
+        client = data.get("client")
+        phone = data.get("phone")
+        code = text
+        
+        try:
+            await client.sign_in(phone=phone, code=code, phone_code_hash=data["hash"])
+            me = await client.get_me()
+            session = client.session.save()
+            
+            save_account(phone, me.username, me.first_name, session)
+            
+            await update.message.reply_text(f"✅ Аккаунт @{me.username or me.first_name} добавлен!")
+            user_state.pop(user_id, None)
+            temp_data.pop(user_id, None)
+            await client.disconnect()
+            
+        except SessionPasswordNeededError:
+            user_state[user_id] = "waiting_password"
+            await update.message.reply_text("🔐 Введите пароль 2FA:")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+            user_state.pop(user_id, None)
+            await client.disconnect()
+    
+    elif state == "waiting_password":
+        data = temp_data.get(user_id, {})
+        client = data.get("client")
+        phone = data.get("phone")
+        
+        try:
+            await client.sign_in(password=text)
+            me = await client.get_me()
+            session = client.session.save()
+            
+            save_account(phone, me.username, me.first_name, session)
+            
+            await update.message.reply_text(f"✅ Аккаунт @{me.username or me.first_name} добавлен!")
+            user_state.pop(user_id, None)
+            temp_data.pop(user_id, None)
+            await client.disconnect()
+            
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+            user_state.pop(user_id, None)
+            await client.disconnect()
+    
+    elif state == "waiting_channels":
+        save_channels(text)
+        user_state[user_id] = "waiting_link"
+        await update.message.reply_text(
+            "🔗 *Этап 2/2*\nВведите ссылку на конкурс:\nПример: https://t.me/bot?start=ref123",
+            parse_mode="Markdown"
+        )
+    
+    elif state == "waiting_link":
+        save_ref_link(text)
+        user_state.pop(user_id, None)
+        await update.message.reply_text("✅ Данные сохранены! Нажмите *НАЧАТЬ УЧАСТВОВАТЬ*", parse_mode="Markdown")
+
+async def start_participation(update: Update, context):
+    query = update.callback_query
+    settings = get_settings()
+    accounts = get_all_accounts()
+    
+    if not accounts:
+        await query.edit_message_text("❌ Нет аккаунтов!")
+        return
+    
+    channels = settings.get('channels', '')
+    ref_link = settings.get('ref_link', '')
+    
+    await query.edit_message_text(f"🚀 Запуск {len(accounts)} аккаунтов...\nЭто может занять несколько минут.")
+    
+    success_count = 0
+    for acc in accounts:
+        acc_id, phone, username, first_name, session = acc
+        name = f"@{username or first_name or 'user'} ({phone})"
+        
+        await context.bot.send_message(OWNER_ID, f"🔄 Обрабатываю {name}...")
+        
+        result = await participate_one_account(session, name, channels, ref_link, context.bot)
+        if result:
+            success_count += 1
+        
+        await asyncio.sleep(5)
+    
+    await context.bot.send_message(OWNER_ID, f"✅ *Завершено!*\nУспешно: {success_count}/{len(accounts)}", parse_mode="Markdown")
+
+# ========== ЗАПУСК ДЛЯ BOTHOST ==========
 
 def main():
-    # Настройка логирования
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=logging.INFO
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    
+    print(f"✅ Бот запущен на порту {PORT}")
+    
+    # Вебхук для Bothost
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN,
+        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
     )
-    
-    # Увеличиваем таймауты для запросов
-    from telegram.request import HTTPXRequest
-    request = HTTPXRequest(
-        connect_timeout=30.0,
-        read_timeout=30.0,
-        write_timeout=30.0
-    )
-    
-    app = Application.builder().token(TOKEN).request(request).build()
-
-    # Добавляем обработчики
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("whyme", start_game))
-    app.add_handler(CommandHandler("start", handle_start))
-    app.add_handler(CallbackQueryHandler(cancel_game, pattern="^cancel_"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    print("✅ Бот «Кто я?» успешно запущен!")
-    print("📝 Используй /help для справки")
-    print("🎮 Для запуска игры используй /whyme в группе")
-    
-    # Запуск с обработкой ошибок
-    try:
-        app.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
-        )
-    except Exception as e:
-        logging.error(f"Ошибка при запуске: {e}")
-
 
 if __name__ == "__main__":
     main()
