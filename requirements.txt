@@ -1,3 +1,4 @@
-python-telegram-bot==20.7
 telethon==1.36.0
-cryptg==0.4.0
+python-telegram-bot==20.7
+aiohttp==3.9.5
+Pillow==10.3.0
